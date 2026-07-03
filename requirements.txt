@@ -1,0 +1,22 @@
+# ── Core orchestration & LLM bindings ───────────────────────────────────────
+langgraph>=0.2.60          # stateful multi-agent graphs (StateGraph, Send)
+langchain>=0.3.0           # runnable / message abstractions
+langchain-core>=0.3.0      # BaseMessage, Runnable interfaces
+langchain-groq>=0.2.0      # ChatGroq (Llama-3.3-70b / 3.1-8b on GroqCloud)
+
+# ── Tools the agents use ────────────────────────────────────────────────────
+langchain-tavily>=0.2.0    # reliable web search (needs TAVILY_API_KEY, optional)
+langchain-community>=0.3.0 # DuckDuckGo + Wikipedia wrappers, WebBaseLoader
+ddgs>=9.0.0                # backend for DuckDuckGo search wrapper (keyless)
+wikipedia>=1.4.0           # backend for the Wikipedia tool (keyless)
+beautifulsoup4>=4.12.0     # used by WebBaseLoader for light page fetching
+
+# ── RAG layer (optional, falls back gracefully if unavailable) ──────────────
+langchain-huggingface>=0.1.0
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+
+# ── Misc ────────────────────────────────────────────────────────────────────
+pydantic>=2.7.0            # structured outputs & validation
+python-dotenv>=1.0.0       # load .env
+rich>=13.7.0               # pretty CLI report (optional but nice)

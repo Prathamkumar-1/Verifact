@@ -1,0 +1,43 @@
+# ── secrets & local config ───────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+.tox/
+
+# ── venvs ────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── models / caches downloaded at runtime ────────────────
+models/
+*.faiss
+*.pkl
+
+# ── editor / OS ──────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── logs ─────────────────────────────────────────────────
+*.log
+logs/
