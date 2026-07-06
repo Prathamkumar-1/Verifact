@@ -1,9 +1,3 @@
-"""Pydantic models that define the data flowing between agents.
-
-Using typed schemas (and `with_structured_output`) means each agent returns a
-validated object instead of free text, which keeps the graph robust and makes
-the whole pipeline inspectable.
-"""
 from __future__ import annotations
 
 from typing import Literal
@@ -11,112 +5,58 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-# ─── Pieces of evidence gathered during research ────────────────────────────
 class Evidence(BaseModel):
-    """A single factoid pulled from a source during research."""
-
-    claim_aspect: str = Field(
-        description="The sub-question this evidence speaks to."
-    )
-    snippet: str = Field(
-        description="The relevant text found in the source, quoted or paraphrased."
-    )
-    source_url: str = Field(description="URL of the source, or 'wikipedia' if unknown.")
-    source_title: str = Field(default="", description="Title of the source page/article.")
+    claim_aspect: str = Field(description="The sub-question this evidence speaks to.")
+    snippet: str = Field(description="The relevant text found in the source.")
+    source_url: str = Field(description="URL of the source.")
+    source_title: str = Field(default="", description="Title of the source.")
     stance: Literal["supports", "refutes", "neutral"] = Field(
-        description="Whether this snippet supports, refutes, or is neutral toward the original claim."
+        description="Whether this supports, refutes, or is neutral toward the claim."
     )
 
 
-# ─── Planner output ──────────────────────────────────────────────────────────
 class SubQuestion(BaseModel):
-    """One atomic, searchable question derived from the claim."""
-
     question: str = Field(description="A focused web-searchable question.")
-    rationale: str = Field(default="", description="Why this question matters for the claim.")
+    rationale: str = Field(default="", description="Why this question matters.")
 
 
 class ResearchPlan(BaseModel):
-    """The Planner's decomposition of the claim."""
-
     sub_questions: list[SubQuestion] = Field(
-        description="2 to 4 atomic questions that together cover the claim."
+        description="2 to 4 atomic questions that cover the claim."
     )
 
 
-# ─── Analyst outputs ─────────────────────────────────────────────────────────
 class EvidenceSummary(BaseModel):
-    """The Evidence Analyst's read of the gathered evidence."""
-
-    supporting_points: list[str] = Field(
-        default_factory=list, description="Points that support the claim, each with a citation hint."
-    )
-    refuting_points: list[str] = Field(
-        default_factory=list, description="Points that refute the claim, each with a citation hint."
-    )
-    open_questions: list[str] = Field(
-        default_factory=list, description="Things the evidence could not resolve."
-    )
+    supporting_points: list[str] = Field(default_factory=list)
+    refuting_points: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
 
 
 class CredibilityReport(BaseModel):
-    """The Credibility Analyst's assessment of the evidence base."""
-
-    source_quality: float = Field(
-        ge=0, le=1, description="Average trustworthiness of the sources (1 = peer-reviewed/official)."
-    )
-    recency: float = Field(
-        ge=0, le=1, description="How current the evidence is (1 = very recent)."
-    )
-    cross_source_agreement: float = Field(
-        ge=0, le=1, description="How well independent sources agree (1 = strong agreement)."
-    )
-    bias_flags: list[str] = Field(
-        default_factory=list, description="Noted biases, conflicts of interest, or contradictions."
-    )
+    source_quality: float = Field(ge=0, le=1)
+    recency: float = Field(ge=0, le=1)
+    cross_source_agreement: float = Field(ge=0, le=1)
+    bias_flags: list[str] = Field(default_factory=list)
 
 
-# ─── Supervisor routing ──────────────────────────────────────────────────────
 class SupervisorDecision(BaseModel):
-    """How the supervisor wants to route the workflow next."""
-
-    next: Literal["plan", "research", "analyze", "judge"] = Field(
-        description="The next node to run."
-    )
-    reasoning: str = Field(default="", description="One line on why this route was chosen.")
+    next: Literal["plan", "research", "analyze", "judge"]
+    reasoning: str = Field(default="")
 
 
-# ─── Human-in-the-loop review ────────────────────────────────────────────────
 class HumanReview(BaseModel):
-    """A human's decision on a proposed verdict.
-
-    This is the value the caller passes back into `Command(resume=...)` when the
-    approval gate interrupts. We model it as a Pydantic type so the resume
-    payload is documented and validated.
-    """
-
-    approved: bool = Field(description="True to accept the verdict, False to reject it.")
-    feedback: str = Field(
-        default="", description="If rejected, what the judge should fix on the retry."
-    )
+    approved: bool = Field(description="True to accept, False to reject.")
+    feedback: str = Field(default="", description="Feedback if rejected.")
 
 
-# ─── Final verdict ───────────────────────────────────────────────────────────
 VerdictLabel = Literal["true", "false", "mixed", "unverified"]
 
 
 class Verdict(BaseModel):
-    """The Judge's final, structured ruling."""
-
     label: VerdictLabel = Field(
-        description="true = the claim is accurate; false = it is inaccurate; "
-        "mixed = partly accurate; unverified = insufficient reliable evidence."
+        description="true, false, mixed, or unverified."
     )
-    confidence: float = Field(
-        ge=0, le=1, description="Confidence in the verdict (0 to 1)."
-    )
-    one_line: str = Field(description="A single-sentence summary of the verdict.")
+    confidence: float = Field(ge=0, le=1, description="Confidence from 0 to 1.")
+    one_line: str = Field(description="One-sentence summary.")
     reasoning: str = Field(description="2-4 sentences explaining the verdict.")
-    citations: list[str] = Field(
-        default_factory=list, description="URLs/sources that back the verdict."
-    )
+    citations: list[str] = Field(default_factory=list)
