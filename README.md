@@ -1,4 +1,4 @@
-# Verifact 🔍 — A Multi-Agent Claim Verification System
+# Verifact  — A Multi-Agent Claim Verification System
 
 > **Don't just ask an LLM whether something is true — make it gather evidence first.**
 >
@@ -36,7 +36,7 @@ a retrieval step before anyone is allowed to judge.
 | 3 | **Evidence Analyst** | Pulls the most relevant chunks via **RAG** (HF embeddings + FAISS) and sorts them into supporting / refuting / open. | Needs retrieval, not search — it reasons over *already-gathered* evidence. |
 | 4 | **Credibility Analyst** | Scores source quality, recency, and cross-source agreement; flags bias/contradiction. | A separate lens from content analysis: two weak blogs agreeing is very different from two Reuters reports agreeing. |
 | 5 | **Judge** | Combines the analyst's summary + the credibility report into the final structured `Verdict`. | The only agent allowed to commit to a label, and it's deliberately downstream of all the others so it can't shortcut. |
-| 🛂 | **Approval Gate** *(HITL)* | Pauses the graph after the Judge rules so a human can approve the verdict, or reject it and send it back with feedback. | High-stakes decisions shouldn't be finalized silently — the Week 4 notes call this out explicitly. |
+| 6 | **Approval Gate** *(HITL)* | Pauses the graph after the Judge rules so a human can approve the verdict, or reject it and send it back with feedback. | High-stakes decisions shouldn't be finalized silently — the Week 4 notes call this out explicitly. |
 
 A seventh role, the **Supervisor**, isn't a "worker" — it's the coordinator that
 decides which agent runs next.
@@ -45,14 +45,13 @@ decides which agent runs next.
 
 ## Orchestration
 
-Verifact deliberately combines **three** of the patterns taught in Week 4:
+Verifact deliberately combines **three** of the patterns:
 
 ### 1. Supervisor (primary pattern)
 A coordinator node inspects the shared state and routes to the next agent
 dynamically — there is **no fixed pipeline**. Critically, the supervisor can
 send the system *back for another research round* if too little evidence was
-gathered, up to a cap. That dynamic re-routing is what distinguishes a real
-supervisor from a glorified linear chain.
+gathered, up to a cap. 
 
 ### 2. Parallel + Aggregator (map-reduce)
 The research step is a fan-out: one `Send("researcher", {...})` is spawned per
@@ -96,11 +95,7 @@ prompts the user, and resumes with `Command(resume=HumanReview(...))`.
 - `judge` → `approval_gate`, which routes via `Command` to `judge` (retry) or `finalize`
 
 ### State management
-
-Following the Week 4 guidance, we use a **shared global state** (this project is
-small enough that explicit key ownership is easy to track). The "rule of thumb"
-from the notes — *"be deliberate about which keys each agent is allowed to
-touch"* — is enforced by convention and documented inline on every field:
+we use a **shared global state**.
 
 | State key | Who writes it | Notes |
 |---|---|---|
@@ -135,7 +130,7 @@ size (per instructor guidance in the cohort channel).
 7. **Supervisor** → **Judge**, which issues a proposed structured `Verdict`.
    *(If the verdict is malformed, the Judge retries with a corrective prompt;
    if all retries fail, it emits a conservative fallback — see below.)*
-8. **🛂 Approval Gate** pauses the graph (`interrupt()`). The CLI shows you the
+8. **Approval Gate** pauses the graph (`interrupt()`). The CLI shows you the
    proposed verdict and asks: accept, or reject + give feedback. On rejection
    the Judge reruns with your note; otherwise the verdict is finalized.
 9. The CLI pretty-prints the final verdict, the evidence summary, the
@@ -143,14 +138,7 @@ size (per instructor guidance in the cohort channel).
 
 ---
 
-## Failure handling (Week 4 requirement)
-
-The Week 4 notes are explicit: *"Build at least one of these three into your
-capstone — retries, fallback agents, or human-in-the-loop checkpoints.
-Without this, capstones tend to fail silently instead of degrading gracefully."*
-
-Verifact implements **all three**, layered so the system degrades gracefully
-rather than crashing:
+## Failure handling
 
 | Mechanism | Where | What it does |
 |---|---|---|
@@ -245,7 +233,7 @@ Judge has produced a verdict:
 
 ```
 ============================================================
-🛂  HUMAN APPROVAL REQUIRED (Week 4 HITL checkpoint)
+HUMAN APPROVAL REQUIRED (Week 4 HITL checkpoint)
 ============================================================
   Proposed verdict: FALSE   (confidence 88%)
   Summary: The Great Wall is not visible from the unaided eye in space.
@@ -295,63 +283,6 @@ requirements.txt
 .env.example
 README.md
 ```
-
----
-
-## Design decisions & trade-offs
-
-- **Why a supervisor instead of a fixed pipeline?** A pipeline can't adapt: if
-  the first research round returns almost nothing, a pipeline would still march
-  straight to a confident-looking verdict. The supervisor's "go research more"
-  branch is the difference between a robust system and a theatrical one.
-- **Why a human-in-the-loop gate and not just an automated pipeline?** Fact-check
-  verdicts are high-stakes and sometimes genuinely ambiguous. The Week 4 notes
-  single out HITL as the recommended safeguard for exactly this case, and
-  `interrupt()` makes it cheap to pause a LangGraph run. It's also the most
-  defensible failure-handling choice for a demo — a reviewer watching the verdict
-  get finalized sees the system *asking* before committing, which is the whole
-  point of responsible fact-checking.
-- **Why all three failure mechanisms and not just one?** They layer: retries
-  fix transient model errors, the fallback guarantees the run always completes,
-  and HITL catches semantic mistakes the model can't. One alone isn't enough
-  for a system whose output people might act on.
-- **Why two analysts instead of one?** Content and credibility are orthogonal.
-  Ten blogs all parroting the same rumour look like "strong agreement" to a
-  single analyst; splitting credibility into its own agent keeps that trap
-  visible in the final score.
-- **Why parallel research?** Latency and breadth. Sub-questions are independent,
-  so running them sequentially would just waste time, and the cheap 8B model is
-  fast enough to run several concurrently under Groq.
-- **Why RAG over the evidence?** Researchers return noisy, sometimes huge blobs.
-  Embedding them and retrieving only the chunks relevant to the *original* claim
-  keeps the analyst focused and the prompt small — a small, deliberate use of
-  the Week 2 RAG material inside an agentic system.
-- **Why structured outputs everywhere?** Free-text handoffs between agents are
-  fragile (one agent paraphrases a field name and the next one can't find it).
-  Pydantic schemas make the contract explicit and the pipeline debuggable.
-- **Why graceful degradation?** A grader or contest judge should be able to run
-  this with just a Groq key. If Tavily isn't set, we use DuckDuckGo; if the
-  embedding model can't download, we use raw snippets. Nothing should hard-fail
-  on a missing optional dependency.
-
----
-
-## Limitations & future work
-
-- **Search quality is the ceiling.** With DuckDuckGo alone, rate-limiting and
-  thin results are common; adding a Tavily key materially improves verdicts.
-- **No claim/source image understanding** — text only.
-- **Single language** (English) — the prompts and sources are English-centric.
-- **In-process memory only.** We attach an `InMemorySaver` checkpointer (needed
-  for the HITL interrupt), so state persists *within* a run's thread but is lost
-  when the process exits. A natural next step is a durable checkpointer
-  (`langgraph-checkpoint-sqlite`) so Verifact can remember prior verdicts and
-  avoid re-researching identical sub-questions across runs.
-- **Possible additions:** a "freshness" agent that biases toward recent sources
-  for news claims; a hierarchical supervisor for multi-claim batches; exposing
-  the graph over a FastAPI endpoint or a Streamlit UI.
-
----
 
 ## Running the tests
 
