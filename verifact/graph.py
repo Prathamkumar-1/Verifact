@@ -6,6 +6,10 @@ Orchestration patterns used:
   * **Parallel + Aggregator** (map-reduce): the research step fans out one
     `Send("researcher", ...)` per sub-question, and the analysts run in parallel
     too. Outputs are aggregated via `operator.add` reducers on the state.
+  * **Human-in-the-loop checkpoint** (failure handling): after the Judge rules,
+    the `approval_gate` node calls `interrupt()` to pause for human approval. The
+    gate returns a `Command(goto=..., update=...)` to either retry the Judge
+    (on rejection) or finalize — combining routing + state update in one step.
 
 The graph deliberately avoids a fixed `plan -> research -> analyze -> judge`
 linear chain: the supervisor decides transitions dynamically. That dynamic
@@ -19,7 +23,7 @@ from typing import Annotated, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from . import agents
+from . import agents, config
 from .schemas import (
     CredibilityReport,
     Evidence,
@@ -30,6 +34,10 @@ from .schemas import (
 
 
 # ─── Shared state ────────────────────────────────────────────────────────────
+# STATE DECISION (Week 4 guidance):
+# We use a SHARED GLOBAL state. This is the recommended choice when the project
+# is small enough to reason about key ownership directly. Each field below lists
+# which agent(s) are allowed to WRITE it — read access is unrestricted.
 class VerifactState(TypedDict, total=False):
     """The shared blackboard every agent reads from and writes to.
 
@@ -39,25 +47,28 @@ class VerifactState(TypedDict, total=False):
     """
 
     # Input
-    claim: str
+    claim: str                                   # write: caller (input only)
 
     # Planner output
-    sub_questions: list[str]
+    sub_questions: list[str]                     # write: planner
 
     # Researcher output — aggregated across the parallel fan-out.
-    evidence: Annotated[list[Evidence], add]
+    evidence: Annotated[list[Evidence], add]     # write: researcher (×N)
 
     # Analyst outputs (written once each)
-    evidence_summary: EvidenceSummary
-    credibility: CredibilityReport
+    evidence_summary: EvidenceSummary            # write: evidence_analyst
+    credibility: CredibilityReport               # write: credibility_analyst
 
-    # Final verdict
-    verdict: Verdict
+    # Final verdict + human-in-the-loop bookkeeping
+    verdict: Verdict                             # write: judge
+    approved: bool                               # write: approval_gate / finalize
+    judge_feedback: str                          # write: approval_gate (→ judge)
+    hitl_rejections: int                         # write: approval_gate
 
     # Supervisor bookkeeping
-    next: str
-    research_rounds: int
-    supervisor_note: str
+    next: str                                    # write: supervisor
+    research_rounds: int                         # write: start_research
+    supervisor_note: str                         # write: supervisor
 
 
 # ─── Node wrappers ───────────────────────────────────────────────────────────
@@ -92,6 +103,15 @@ def _judge(state: VerifactState) -> dict:
     return agents.judge_agent(state)
 
 
+def _approval_gate(state: VerifactState):
+    """Human-in-the-loop checkpoint. Returns a `Command` (routes + updates)."""
+    return agents.approval_gate(state)
+
+
+def _finalize(state: VerifactState) -> dict:
+    return agents.finalize(state)
+
+
 def _supervise(state: VerifactState) -> dict:
     return agents.supervisor_agent(state)
 
@@ -121,8 +141,25 @@ def fan_out_research(state: VerifactState) -> list[Send]:
 
 
 # ─── Graph builder ───────────────────────────────────────────────────────────
-def build_graph():
-    """Construct and compile the Verifact multi-agent graph."""
+def build_graph(human_in_the_loop: bool | None = None):
+    """Construct and compile the Verifact multi-agent graph.
+
+    Args:
+        human_in_the_loop: If True, the verdict is routed through an approval
+            gate that pauses the graph for human review (Week 4 HITL pattern).
+            If False, the verdict is finalized automatically. Defaults to the
+            ``HUMAN_IN_THE_LOOP`` config flag.
+
+    A checkpointer is ALWAYS attached, because `interrupt()` requires one and
+    it also lets the CLI drive a pause/resume approval loop.
+    """
+    # Import here so the smoke test (which has no deps beyond langgraph) still
+    # imports this module without requiring the checkpointer package.
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    if human_in_the_loop is None:
+        human_in_the_loop = config.HUMAN_IN_THE_LOOP
+
     builder = StateGraph(VerifactState)
 
     # Register every node.
@@ -134,6 +171,8 @@ def build_graph():
     builder.add_node("evidence_analyst", _analyze_evidence)
     builder.add_node("credibility_analyst", _analyze_credibility)
     builder.add_node("judge", _judge)
+    builder.add_node("approval_gate", _approval_gate)  # HITL checkpoint
+    builder.add_node("finalize", _finalize)            # terminal marker
 
     # Entry → supervisor.
     builder.add_edge(START, "supervisor")
@@ -160,7 +199,15 @@ def build_graph():
     builder.add_edge("evidence_analyst", "supervisor")
     builder.add_edge("credibility_analyst", "supervisor")
 
-    # Once the judge has ruled, we're done.
-    builder.add_edge("judge", END)
+    # The judge's output goes through the approval gate (or straight to finalize
+    # when HITL is disabled). The gate routes via `Command(goto=...)`, so it has
+    # no static outgoing edge here — LangGraph follows the Command instead.
+    if human_in_the_loop:
+        builder.add_edge("judge", "approval_gate")
+        # approval_gate → (via Command) either "judge" (rejected, retry) or "finalize"
+        builder.add_edge("finalize", END)
+    else:
+        builder.add_edge("judge", "finalize")
+        builder.add_edge("finalize", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=InMemorySaver())

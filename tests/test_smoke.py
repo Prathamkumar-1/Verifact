@@ -51,7 +51,7 @@ def test_graph_compiles():
     # We bypass config.require_groq_key by not invoking — only compiling.
     from verifact.graph import build_graph, VerifactState
 
-    graph = build_graph()
+    graph = build_graph(human_in_the_loop=False)
     assert graph is not None
     # State should declare the key fields with their reducer semantics.
     hints = VerifactState.__annotations__
@@ -59,6 +59,44 @@ def test_graph_compiles():
     assert "evidence" in hints
     assert "verdict" in hints
     print("test_graph_compiles: OK")
+
+
+def test_graph_compiles_with_hitl():
+    """The graph should also compile WITH the human-in-the-loop gate wired in."""
+    from verifact.graph import build_graph
+
+    graph = build_graph(human_in_the_loop=True)
+    assert graph is not None
+    # The approval_gate and finalize nodes must exist in the compiled graph.
+    node_names = set(graph.get_graph().nodes.keys())
+    assert "approval_gate" in node_names
+    assert "finalize" in node_names
+    print("test_graph_compiles_with_hitl: OK")
+
+
+def test_verdict_validation_and_fallback():
+    """The Judge's validation + fallback logic should behave correctly."""
+    from verifact.agents import _verdict_is_valid, _judge_fallback
+    from verifact.schemas import Verdict
+
+    # None fails validation.
+    assert _verdict_is_valid(None) is False
+    # A verdict with empty fields fails validation.
+    assert _verdict_is_valid(Verdict(label="true", confidence=0.9,
+                                     one_line="", reasoning="x")) is False
+    assert _verdict_is_valid(Verdict(label="true", confidence=0.9,
+                                     one_line="x", reasoning="")) is False
+
+    # A well-formed verdict passes.
+    good = Verdict(label="false", confidence=0.8, one_line="no",
+                   reasoning="because", citations=["http://x"])
+    assert _verdict_is_valid(good) is True
+
+    # The fallback is always a conservative 'unverified'.
+    fb = _judge_fallback("judge exploded", "some claim")
+    assert fb.label == "unverified"
+    assert _verdict_is_valid(fb) is True
+    print("test_verdict_validation_and_fallback: OK")
 
 
 def test_state_reducer_aggregates():
@@ -81,5 +119,7 @@ def test_state_reducer_aggregates():
 if __name__ == "__main__":
     test_schemas_validate()
     test_graph_compiles()
+    test_graph_compiles_with_hitl()
+    test_verdict_validation_and_fallback()
     test_state_reducer_aggregates()
     print("\nAll smoke tests passed.")

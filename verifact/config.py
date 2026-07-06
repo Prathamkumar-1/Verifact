@@ -37,6 +37,17 @@ RAG_TOP_K = int(os.getenv("VERIFACT_RAG_TOP_K", "6"))
 # round. This caps how many times it can do so before being forced to judge.
 MAX_RESEARCH_ROUNDS = int(os.getenv("VERIFACT_MAX_RESEARCH_ROUNDS", "2"))
 
+# ─── Failure handling (Week 4 requirement: build in ≥1 mechanism) ────────────
+# (1) Retries: when the Judge returns a malformed/empty verdict, we retry with a
+#     "fix your output" prompt before giving up.
+JUDGE_MAX_RETRIES = int(os.getenv("VERIFACT_JUDGE_RETRIES", "2"))
+
+# (2) Human-in-the-loop: before a verdict is finalized, pause the graph and let a
+#     human approve it. Disable for fully-automated runs (e.g. batch tests).
+HUMAN_IN_THE_LOOP = os.getenv("VERIFACT_HITL", "1") == "1"
+# How many times a human can reject a verdict and ask the Judge to redo it.
+HITL_MAX_REJECTIONS = int(os.getenv("VERIFACT_HITL_MAX_REJECTIONS", "1"))
+
 # ─── Misc ────────────────────────────────────────────────────────────────────
 VERBOSE = os.getenv("VERIFACT_VERBOSE", "0") == "1"
 

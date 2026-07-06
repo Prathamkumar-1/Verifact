@@ -17,15 +17,16 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
+from langgraph.types import Command, interrupt
 
 from . import config
 from .schemas import (
     CredibilityReport,
     Evidence,
     EvidenceSummary,
+    HumanReview,
     ResearchPlan,
     SubQuestion,
-    SupervisorDecision,
     Verdict,
 )
 from .tools import EvidenceRAG, build_wikipedia_tool, build_web_search_tool
@@ -241,13 +242,54 @@ def credibility_analyst(state: dict) -> dict:
 
 
 # ============================================================================
-# Agent 5 — Judge: produce the final verdict
+# Agent 5 — Judge: produce the final verdict (with retry failure handling)
 # ============================================================================
+def _verdict_is_valid(v: Verdict | None) -> bool:
+    """Cheap validation pass on the Judge's output.
+
+    This is the first failure-handling mechanism from the Week 4 notes
+    (retries): if the model returns something empty or malformed, we detect it
+    and retry with a corrective prompt before falling back.
+    """
+    if v is None:
+        return False
+    if not v.label or not v.one_line or not v.reasoning:
+        return False
+    if not (0.0 <= v.confidence <= 1.0):
+        return False
+    return True
+
+
+def _judge_fallback(reasoning: str, claim: str) -> Verdict:
+    """Fallback verdict used only if the Judge fails every retry.
+
+    The second failure-handling mechanism: instead of crashing, we emit a
+    conservative `unverified` verdict so the run degrades gracefully — exactly
+    the "fallback agent" pattern from the Week 4 notes.
+    """
+    log.warning("[Judge] All retries exhausted — using fallback verdict.")
+    return Verdict(
+        label="unverified",
+        confidence=0.0,
+        one_line="The system could not produce a reliable verdict for this claim.",
+        reasoning=reasoning,
+        citations=[],
+    )
+
+
 def judge_agent(state: dict) -> dict:
-    """Synthesise the analysis + credibility into a final verdict."""
+    """Synthesise the analysis + credibility into a final verdict.
+
+    Implements the **retry** failure-handling pattern: the model is called up
+    to `JUDGE_MAX_RETRIES + 1` times. Each retry after the first adds a
+    "your previous output was invalid, fix it" instruction so the model
+    corrects itself rather than silently producing garbage.
+    """
     claim = state["claim"]
     summary = state.get("evidence_summary")
     credibility = state.get("credibility")
+    # Feedback from a human rejection (HITL) re-enters here.
+    feedback = state.get("judge_feedback", "")
     log.info("[Judge] Issuing verdict for: %s", claim)
 
     system = (
@@ -273,10 +315,96 @@ def judge_agent(state: dict) -> dict:
         f"ANALYSIS:\n{json.dumps(payload, indent=2)}\n\n"
         f"Issue the structured verdict."
     )
-    verdict = _llm(config.MODEL_STRONG).with_structured_output(Verdict).invoke(
-        [SystemMessage(content=system), HumanMessage(content=user)]
-    )
+    if feedback:
+        # A reviewer asked the judge to reconsider — fold their note in.
+        user += f"\n\nREVIEWER FEEDBACK TO ADDRESS: {feedback}"
+
+    structured = _llm(config.MODEL_STRONG).with_structured_output(Verdict)
+
+    # Retry loop: try, validate, and re-ask with a corrective nudge if bad.
+    attempts = config.JUDGE_MAX_RETRIES + 1
+    verdict = None
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            messages = [SystemMessage(content=system), HumanMessage(content=user)]
+            if last_error:
+                messages.append(HumanMessage(
+                    content=f"Your previous attempt failed validation: "
+                    f"{last_error}. Please re-issue a complete, valid verdict."
+                ))
+            verdict = structured.invoke(messages)
+            if _verdict_is_valid(verdict):
+                log.info("[Judge] Valid verdict on attempt %d.", attempt)
+                break
+            last_error = "missing or empty fields, or confidence out of range"
+            log.warning("[Judge] Attempt %d produced invalid verdict.", attempt)
+        except Exception as exc:  # pragma: no cover - network / API path
+            last_error = str(exc)
+            log.warning("[Judge] Attempt %d raised: %s", attempt, exc)
+
+    if not _verdict_is_valid(verdict):
+        verdict = _judge_fallback(
+            f"Judge failed after {attempts} attempts (last issue: {last_error}).",
+            claim,
+        )
+
     return {"verdict": verdict}
+
+
+# ============================================================================
+# Agent 6 — Approval Gate: human-in-the-loop checkpoint
+# ============================================================================
+def approval_gate(state: dict) -> Command:
+    """Pause for human approval before the verdict is finalized.
+
+    This is the **human-in-the-loop** failure-handling pattern from Week 4,
+    implemented with LangGraph's `interrupt()`. The graph pauses here, surfaces
+    the proposed verdict to the caller, and resumes only after the human
+    decides. On rejection (within the rejection cap) we route back to the Judge
+    with the reviewer's feedback; on approval (or cap reached) we finish.
+
+    Returns a `Command` instead of a dict so we can route AND update state in
+    one step — the `Command(goto=..., update=...)` pattern from Week 4.
+    """
+    verdict = state.get("verdict")
+    rejections = state.get("hitl_rejections", 0)
+
+    # Surface the proposed verdict to the caller. On resume, `review` becomes
+    # the value passed to `Command(resume=HumanReview(...))`.
+    review: HumanReview = interrupt({
+        "kind": "verdict_review",
+        "claim": state["claim"],
+        "proposed_verdict": verdict.model_dump() if verdict else None,
+        "rejections_so_far": rejections,
+        "max_rejections": config.HITL_MAX_REJECTIONS,
+    })
+
+    if review.approved:
+        log.info("[Gate] Verdict approved by reviewer.")
+        return Command(goto="finalize", update={"approved": True})
+
+    # Rejected. If we still have budget, send back to the judge with feedback.
+    if rejections < config.HITL_MAX_REJECTIONS:
+        log.info("[Gate] Verdict rejected — routing back to Judge (rejection %d).",
+                 rejections + 1)
+        return Command(
+            goto="judge",
+            update={
+                "approved": False,
+                "hitl_rejections": rejections + 1,
+                "judge_feedback": review.feedback or "Reviewer asked for a redo.",
+            },
+        )
+
+    # Out of retries: accept the current verdict to avoid an infinite loop.
+    log.warning("[Gate] Rejection cap reached — accepting current verdict.")
+    return Command(goto="finalize", update={"approved": True})
+
+
+def finalize(state: dict) -> dict:
+    """Terminal marker node: the verdict is locked in and approved."""
+    return {"approved": True}
 
 
 # ============================================================================

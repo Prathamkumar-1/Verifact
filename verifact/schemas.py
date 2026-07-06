@@ -86,6 +86,21 @@ class SupervisorDecision(BaseModel):
     reasoning: str = Field(default="", description="One line on why this route was chosen.")
 
 
+# ─── Human-in-the-loop review ────────────────────────────────────────────────
+class HumanReview(BaseModel):
+    """A human's decision on a proposed verdict.
+
+    This is the value the caller passes back into `Command(resume=...)` when the
+    approval gate interrupts. We model it as a Pydantic type so the resume
+    payload is documented and validated.
+    """
+
+    approved: bool = Field(description="True to accept the verdict, False to reject it.")
+    feedback: str = Field(
+        default="", description="If rejected, what the judge should fix on the retry."
+    )
+
+
 # ─── Final verdict ───────────────────────────────────────────────────────────
 VerdictLabel = Literal["true", "false", "mixed", "unverified"]
 

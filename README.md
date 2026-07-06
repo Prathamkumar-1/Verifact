@@ -27,7 +27,7 @@ a retrieval step before anyone is allowed to judge.
 
 ---
 
-## The five agents
+## The five agents (+ a human-in-the-loop gate)
 
 | # | Agent | Responsibility | Why it can't be merged with the others |
 |---|-------|----------------|----------------------------------------|
@@ -36,17 +36,18 @@ a retrieval step before anyone is allowed to judge.
 | 3 | **Evidence Analyst** | Pulls the most relevant chunks via **RAG** (HF embeddings + FAISS) and sorts them into supporting / refuting / open. | Needs retrieval, not search — it reasons over *already-gathered* evidence. |
 | 4 | **Credibility Analyst** | Scores source quality, recency, and cross-source agreement; flags bias/contradiction. | A separate lens from content analysis: two weak blogs agreeing is very different from two Reuters reports agreeing. |
 | 5 | **Judge** | Combines the analyst's summary + the credibility report into the final structured `Verdict`. | The only agent allowed to commit to a label, and it's deliberately downstream of all the others so it can't shortcut. |
+| 🛂 | **Approval Gate** *(HITL)* | Pauses the graph after the Judge rules so a human can approve the verdict, or reject it and send it back with feedback. | High-stakes decisions shouldn't be finalized silently — the Week 4 notes call this out explicitly. |
 
-A sixth role, the **Supervisor**, isn't a "worker" — it's the coordinator that
+A seventh role, the **Supervisor**, isn't a "worker" — it's the coordinator that
 decides which agent runs next.
 
 ---
 
 ## Orchestration
 
-Verifact uses **two** of the four orchestration patterns from the course, on purpose:
+Verifact deliberately combines **three** of the patterns taught in Week 4:
 
-### 1. Supervisor (primary)
+### 1. Supervisor (primary pattern)
 A coordinator node inspects the shared state and routes to the next agent
 dynamically — there is **no fixed pipeline**. Critically, the supervisor can
 send the system *back for another research round* if too little evidence was
@@ -59,32 +60,63 @@ sub-question, all running in the same super-step. Their returned evidence lists
 are **aggregated** by an `operator.add` reducer on the shared state — the
 classic map-reduce shape. The two analysts likewise run in parallel.
 
+### 3. Human-in-the-loop checkpoint (failure handling)
+After the Judge rules, the **Approval Gate** node calls LangGraph's
+`interrupt()` to pause the graph and surface the proposed verdict to a human.
+The gate returns a `Command(goto=..., update=...)` — Week 4's "route + update in
+one step" pattern — to either retry the Judge with the reviewer's feedback or
+finalize. The CLI driver detects the pause via `get_state(config).interrupts`,
+prompts the user, and resumes with `Command(resume=HumanReview(...))`.
+
 ### The graph
 
 ```
                          START
                            │
                            ▼
-                    ┌─► supervisor ◄────────────────────┐
-                    │    (routes by state)               │
-                    │   ┌─────┬───────────┬─────────┐     │
-                    │   ▼     ▼           ▼         ▼     │
-                    │ planner  start_research   analyze_step   judge ──► END
-                    │            │  (×N)            │  (×2)
-                    │            ▼                  ▼
-                    │        researcher ──┐    evidence_analyst ──┐
-                    │                     │    credibility_analyst┘
-                    └─────────────────────┴───────────────────────┘
+                    ┌─► supervisor ◄──────────────────────────┐
+                    │    (routes by state)                     │
+                    │   ┌─────┬───────────┬─────────┐           │
+                    │   ▼     ▼           ▼         ▼           │
+                    │ planner  start_research   analyze_step   judge
+                    │            │  (×N)            │  (×2)       │
+                    │            ▼                 ▼             ▼
+                    │        researcher ──┐  evidence_analyst   approval_gate
+                    │                     │  credibility_        (HITL)
+                    │                     │    analyst             │
+                    │                     │                        ▼
+                    └─────────────────────┴────────────────────► finalize ──► END
+                                                              (Command routes
+                                                               approve / retry)
 ```
 
 - `supervisor` → conditional edges to `planner` / `start_research` / `analyze_step` / `judge`
 - `start_research` → fans out into N parallel `researcher` tasks via `Send(...)`
 - `analyze_step` → both analysts run concurrently, then converge back at the supervisor
-- only `judge` reaches `END`
+- `judge` → `approval_gate`, which routes via `Command` to `judge` (retry) or `finalize`
 
-The shared state (`VerifactState`) is a `TypedDict` where the `evidence` field
-carries an `Annotated[list[Evidence], operator.add]` annotation — that single
-line is what makes parallel results combine instead of clobber each other.
+### State management
+
+Following the Week 4 guidance, we use a **shared global state** (this project is
+small enough that explicit key ownership is easy to track). The "rule of thumb"
+from the notes — *"be deliberate about which keys each agent is allowed to
+touch"* — is enforced by convention and documented inline on every field:
+
+| State key | Who writes it | Notes |
+|---|---|---|
+| `claim` | caller (input only) | set once, never overwritten |
+| `sub_questions` | Planner | |
+| `evidence` | Researcher (×N) | `operator.add` reducer — aggregates parallel writes |
+| `evidence_summary` | Evidence Analyst | |
+| `credibility` | Credibility Analyst | |
+| `verdict` | Judge | |
+| `judge_feedback` | Approval Gate | fed back to the Judge on rejection |
+| `approved` / `hitl_rejections` | Approval Gate / Finalize | HITL bookkeeping |
+| `next`, `supervisor_note` | Supervisor | routing decisions |
+| `research_rounds` | `start_research` | caps the re-research loop |
+
+The shared-state choice was confirmed acceptable for supervisor patterns of this
+size (per instructor guidance in the cohort channel).
 
 ---
 
@@ -100,9 +132,34 @@ line is what makes parallel results combine instead of clobber each other.
    another research round (capped at `MAX_RESEARCH_ROUNDS`).
 6. **Supervisor** → `analyze_step`: the **Evidence Analyst** (RAG-backed) and
    the **Credibility Analyst** run **in parallel**, each writing its findings.
-7. **Supervisor** → **Judge**, which issues the final structured `Verdict`.
-8. The CLI pretty-prints the verdict, the evidence summary, the credibility
-   scores, and the citations.
+7. **Supervisor** → **Judge**, which issues a proposed structured `Verdict`.
+   *(If the verdict is malformed, the Judge retries with a corrective prompt;
+   if all retries fail, it emits a conservative fallback — see below.)*
+8. **🛂 Approval Gate** pauses the graph (`interrupt()`). The CLI shows you the
+   proposed verdict and asks: accept, or reject + give feedback. On rejection
+   the Judge reruns with your note; otherwise the verdict is finalized.
+9. The CLI pretty-prints the final verdict, the evidence summary, the
+   credibility scores, and the citations.
+
+---
+
+## Failure handling (Week 4 requirement)
+
+The Week 4 notes are explicit: *"Build at least one of these three into your
+capstone — retries, fallback agents, or human-in-the-loop checkpoints.
+Without this, capstones tend to fail silently instead of degrading gracefully."*
+
+Verifact implements **all three**, layered so the system degrades gracefully
+rather than crashing:
+
+| Mechanism | Where | What it does |
+|---|---|---|
+| **1. Retries** | `judge_agent` | If the Judge returns an empty/malformed verdict (or the API errors), it retries up to `JUDGE_MAX_RETRIES` times, each retry appending a *"your previous output was invalid, fix it"* instruction so the model self-corrects. |
+| **2. Fallback agent** | `_judge_fallback` | If every retry fails, the Judge emits a conservative `unverified` verdict with confidence 0 instead of raising — the run completes and the human reviewer sees that the system couldn't decide. |
+| **3. Human-in-the-loop** | `approval_gate` | The headline mechanism: after the Judge rules, the graph **pauses** and surfaces the verdict for human approval. The reviewer can accept it or reject it with feedback (which routes back to the Judge). Implemented with LangGraph `interrupt()` + `Command(resume=...)`. |
+
+Every external call (web search, Wikipedia, RAG) is additionally wrapped so a
+flaky source degrades the result rather than crashing the run.
 
 ---
 
@@ -110,7 +167,7 @@ line is what makes parallel results combine instead of clobber each other.
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Orchestration | **LangGraph** | `StateGraph`, `Send`, conditional edges, reducers |
+| Orchestration | **LangGraph** | `StateGraph`, `Send` (parallel fan-out), `interrupt()` + `Command(resume/goto)` for HITL, `InMemorySaver` checkpointer |
 | Agent framework | **LangChain** | `Runnable`, `with_structured_output`, tool wrappers |
 | LLMs | **Groq** — `llama-3.3-70b-versatile` (reasoning agents) + `llama-3.1-8b-instant` (researchers) | Fast and free-tier friendly |
 | Web search | **Tavily** (if keyed) → **DuckDuckGo** fallback | Graceful degradation to keyless |
@@ -151,6 +208,11 @@ cp .env.example .env          # Windows: copy .env.example .env
 | `GROQ_API_KEY` | **Yes** | https://console.groq.com/keys (free) |
 | `TAVILY_API_KEY` | Optional (recommended) | https://tavily.com — free 1000 calls/mo; improves search reliability. Without it, Verifact uses keyless DuckDuckGo. |
 
+A few optional **runtime knobs** are also read from the environment (see
+`.env.example`): `VERIFACT_HITL` (on/off for the approval gate),
+`VERIFACT_JUDGE_RETRIES`, `VERIFACT_HITL_MAX_REJECTIONS`, and
+`VERIFACT_MAX_RESEARCH_ROUNDS`.
+
 No key is needed for Wikipedia or the local RAG model.
 
 ---
@@ -158,7 +220,7 @@ No key is needed for Wikipedia or the local RAG model.
 ## Usage
 
 ```bash
-# Verify any claim
+# Verify any claim (with human approval gate — the default)
 python run.py "The Great Wall of China is visible from space."
 
 # Run a built-in sample claim (1–6)
@@ -170,6 +232,27 @@ python run.py --list
 
 # Watch each agent step stream by
 python run.py --verbose "5G networks spread COVID-19."
+
+# Fully automated run — skip the human approval gate (good for batch tests)
+python run.py --no-hitl "Eating eggs is bad for your health."
+
+# Run the gate but auto-approve without prompting
+python run.py --yes "An AI beat the world champion at Go in 2016."
+```
+
+When the human-in-the-loop gate is on, you'll see a prompt like this once the
+Judge has produced a verdict:
+
+```
+============================================================
+🛂  HUMAN APPROVAL REQUIRED (Week 4 HITL checkpoint)
+============================================================
+  Proposed verdict: FALSE   (confidence 88%)
+  Summary: The Great Wall is not visible from the unaided eye in space.
+  Reasoning: Multiple astronauts and NASA sources confirm...
+============================================================
+  [a]ccept   [r]eject (let the Judge retry with your feedback)
+  Your choice [a/r]:
 ```
 
 ### Example output
@@ -199,12 +282,12 @@ Multiple reputable sources confirm the March 2016 AlphaGo vs. Lee Sedol match...
 ```
 verifact/
 ├── __init__.py
-├── config.py       # env vars, model names, runtime knobs
-├── schemas.py      # Pydantic models: Evidence, ResearchPlan, Verdict, ...
+├── config.py       # env vars, model names, failure-handling knobs
+├── schemas.py      # Pydantic models: Evidence, ResearchPlan, Verdict, HumanReview, ...
 ├── tools.py        # web search (Tavily→DDG), Wikipedia, RAG retriever
-├── agents.py       # the 5 agents + supervisor router
+├── agents.py       # the 5 agents + approval gate + supervisor router
 └── graph.py        # VerifactState, build_graph() — the orchestration
-run.py              # CLI entrypoint
+run.py              # CLI entrypoint (drives the HITL pause/resume loop)
 examples.py         # 6 sample claims for demos
 tests/
 └── test_smoke.py   # offline tests (no API key needed)
@@ -221,6 +304,17 @@ README.md
   the first research round returns almost nothing, a pipeline would still march
   straight to a confident-looking verdict. The supervisor's "go research more"
   branch is the difference between a robust system and a theatrical one.
+- **Why a human-in-the-loop gate and not just an automated pipeline?** Fact-check
+  verdicts are high-stakes and sometimes genuinely ambiguous. The Week 4 notes
+  single out HITL as the recommended safeguard for exactly this case, and
+  `interrupt()` makes it cheap to pause a LangGraph run. It's also the most
+  defensible failure-handling choice for a demo — a reviewer watching the verdict
+  get finalized sees the system *asking* before committing, which is the whole
+  point of responsible fact-checking.
+- **Why all three failure mechanisms and not just one?** They layer: retries
+  fix transient model errors, the fallback guarantees the run always completes,
+  and HITL catches semantic mistakes the model can't. One alone isn't enough
+  for a system whose output people might act on.
 - **Why two analysts instead of one?** Content and credibility are orthogonal.
   Ten blogs all parroting the same rumour look like "strong agreement" to a
   single analyst; splitting credibility into its own agent keeps that trap
@@ -248,9 +342,11 @@ README.md
   thin results are common; adding a Tavily key materially improves verdicts.
 - **No claim/source image understanding** — text only.
 - **Single language** (English) — the prompts and sources are English-centric.
-- **No memory across runs.** A natural next step is a checkpointer
+- **In-process memory only.** We attach an `InMemorySaver` checkpointer (needed
+  for the HITL interrupt), so state persists *within* a run's thread but is lost
+  when the process exits. A natural next step is a durable checkpointer
   (`langgraph-checkpoint-sqlite`) so Verifact can remember prior verdicts and
-  avoid re-researching identical sub-questions.
+  avoid re-researching identical sub-questions across runs.
 - **Possible additions:** a "freshness" agent that biases toward recent sources
   for news claims; a hierarchical supervisor for multi-claim batches; exposing
   the graph over a FastAPI endpoint or a Streamlit UI.
@@ -272,6 +368,8 @@ compiles, and the evidence reducer aggregates correctly. No API key required.
 
 - [LangGraph — multi-agent systems](https://langchain-ai.github.io/langgraph/concepts/multi_agent/)
 - [LangGraph — map-reduce / parallelism (`Send`)](https://langchain-ai.github.io/langgraph/how-tos/map_reduce/)
+- [LangGraph — human-in-the-loop (`interrupt` + `Command(resume=...)`)](https://docs.langchain.com/oss/python/langgraph/interrupts)
+- [LangGraph — `Command` (routing + state update)](https://reference.langchain.com/python/langgraph/types/Command)
 - [LangChain — structured outputs](https://python.langchain.com/docs/how_to/structured_output/)
 - [ChatGroq integration](https://python.langchain.com/docs/integrations/chat/groq/)
 - [GroqCloud supported models](https://console.groq.com/docs/models)
